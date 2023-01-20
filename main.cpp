@@ -1,5 +1,8 @@
 #include <stdio.h>
+#include <unistd.h>
 #include <stdint.h>
+#include <time.h>
+#include <stdlib.h>
 #include <fstream>
 #include <cassert>
 #include <stack>
@@ -13,6 +16,12 @@ uint8_t memory[0x1000] = {0};
 int PC = 0;
 uint16_t ADDR = 0;
 std::stack<int> sub_stack;
+uint16_t delay_timer = 0;
+uint16_t sound_timer = 0;
+
+uint32_t* pixels = NULL;
+SDL_Renderer* renderer = NULL;
+SDL_Texture* screen_texture = NULL;
 
 
 #define REG(x) registers[x]
@@ -31,14 +40,23 @@ std::stack<int> sub_stack;
 #define VD REG(0xD)
 #define VE REG(0xE)
 #define VF REG(0xF)
+#define BEEP system("( speaker-test -t sine -f 500 )& pid=$! ; sleep 0.1s ; kill -9 $pid")
 
 #define WIDTH 64
 #define HEIGHT 32
 
-#define DEBUG 1
+#define DEBUG 0
 
 #define DEBUG_PRINT(format, ...) \
   if(DEBUG) {fprintf (stderr, format __VA_OPT__(,) __VA_ARGS__);}
+
+void update_window()
+{
+	SDL_RenderClear(renderer);
+	SDL_UpdateTexture(screen_texture, NULL, pixels, WIDTH * 4);
+	SDL_RenderCopy(renderer, screen_texture, NULL, NULL);
+	SDL_RenderPresent(renderer);
+}
 
 
 
@@ -188,8 +206,19 @@ OpCode decode(Instruction inst)
 			return OP_9XY0;
 		case 0xA0: /* ANNN Store memory address NNN in register I */
 			return OP_ANNN;
+		case 0xC0:
+			return OP_CXNN;
 		case 0xD0:
 			return OP_DXYN;
+		case 0xE0: {
+			if(inst.b == 0x9E) {
+				return OP_EX9E;
+			} else if(inst.b == 0xA1) {
+				return OP_EXA1;
+			} else {
+				assert(false);
+			}
+		} break;
 		case 0xF0: {
 			if(inst.b == 0x07) { 		/* FX07 Store the current value of the delay timer in register VX */
 				return OP_FX07;
@@ -212,10 +241,9 @@ OpCode decode(Instruction inst)
 			} else {
 				assert(false);
 			}
-		}
-		break;
+		} break;
 	default:
-		printf("No such opcode implemented yet.\n");
+		printf("No such opcode (%X%X) implemented yet.\n", inst.a, inst.b);
 		assert(false);
 		break;
 	}
@@ -232,6 +260,8 @@ void execute(OpCode op, Instruction inst, uint32_t* pixels)
 		case OP_00E0: {
 			DEBUG_PRINT("CLEAR SCREEN\n");
 			memset(pixels, 0x0, WIDTH*HEIGHT*sizeof(uint32_t));
+
+			update_window();
 		}
 		break;
 		case OP_0NNN: {
@@ -415,6 +445,9 @@ void execute(OpCode op, Instruction inst, uint32_t* pixels)
 			ADDR=(inst.b | low << 8);
 			DEBUG_PRINT("store address %03X in register I\n", ADDR);
 		} break;
+		case OP_CXNN: {
+			REG(low) = (uint8_t)(rand() % 0xFF) & inst.b;
+		} break;
 		/* Draw a sprite at position VX, VY with N bytes of sprite data starting at the address stored in I
 		Set VF to 01 if any set pixels are changed to unset, and 00 otherwise */
 		case OP_DXYN: {
@@ -428,48 +461,165 @@ void execute(OpCode op, Instruction inst, uint32_t* pixels)
 			{
 				uint8_t pixel_bits = memory[ADDR+y];
 
-				std::vector<int> was_set(0);
+				const uint32_t color_mask = 0xFFFFFFFF;
+				pixels[((X+0)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+0)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x80) > 0 ? color_mask : 0x0));
+				pixels[((X+1)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+1)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x40) > 0 ? color_mask : 0x0));
+				pixels[((X+2)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+2)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x20) > 0 ? color_mask : 0x0));
+				pixels[((X+3)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+3)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x10) > 0 ? color_mask : 0x0));
+				pixels[((X+4)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+4)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x8) > 0 ? color_mask : 0x0));
+				pixels[((X+5)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+5)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x4) > 0 ? color_mask : 0x0));
+				pixels[((X+6)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+6)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x2) > 0 ? color_mask : 0x0));
+				pixels[((X+7)%WIDTH) + (Y+y) * WIDTH] = (pixels[((X+7)%WIDTH) + (Y+y) * WIDTH] ^ ((pixel_bits & 0x1) > 0 ? color_mask : 0x0));
 
-				for(int x = 0; x < 8; x++) {
-					if(pixels[X+x + Y+y * WIDTH] > 0) {
-						was_set.emplace_back(X+x + Y+y * WIDTH);
-					}
+				if(memory[ADDR+y] < pixel_bits) {
+					VF=1;
 				}
+			}
 
-				pixels[((X+0)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+0 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x80) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+1)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+1 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x40) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+2)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+2 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x20) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+3)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+3 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x10) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+4)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+4 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x8) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+5)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+5 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x4) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+6)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+6 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x2) > 0 ? 0xFFFFFFFF : 0x0));
-				pixels[((X+7)%WIDTH) + (Y+y) * WIDTH] = (pixels[X+7 + (Y+y) * WIDTH] ^ ((pixel_bits & 0x1) > 0 ? 0xFFFFFFFF : 0x0));
+			update_window();
+		} break;
+		case OP_EX9E: { /* Skip the following instruction if the key corresponding to the hex value currently stored in register VX is pressed */
+			const uint8_t* key_state = SDL_GetKeyboardState(NULL);
+			const uint8_t reg_val = REG(low);
+			bool skip = reg_val == 0x0 && !key_state[SDL_SCANCODE_0];
+			skip = skip || (reg_val == 0x1 && key_state[SDL_SCANCODE_1]);
+			skip = skip || (reg_val == 0x2 && key_state[SDL_SCANCODE_2]);
+			skip = skip || (reg_val == 0x3 && key_state[SDL_SCANCODE_3]);
+			skip = skip || (reg_val == 0x4 && key_state[SDL_SCANCODE_4]);
+			skip = skip || (reg_val == 0x5 && key_state[SDL_SCANCODE_5]);
+			skip = skip || (reg_val == 0x6 && key_state[SDL_SCANCODE_6]);
+			skip = skip || (reg_val == 0x7 && key_state[SDL_SCANCODE_7]);
+			skip = skip || (reg_val == 0x8 && key_state[SDL_SCANCODE_8]);
+			skip = skip || (reg_val == 0x9 && key_state[SDL_SCANCODE_9]);
+			skip = skip || (reg_val == 0xA && key_state[SDL_SCANCODE_A]);
+			skip = skip || (reg_val == 0xB && key_state[SDL_SCANCODE_B]);
+			skip = skip || (reg_val == 0xC && key_state[SDL_SCANCODE_C]);
+			skip = skip || (reg_val == 0xD && key_state[SDL_SCANCODE_D]);
+			skip = skip || (reg_val == 0xE && key_state[SDL_SCANCODE_E]);
+			skip = skip || (reg_val == 0xF && key_state[SDL_SCANCODE_F]);
 
-				for(size_t i = 0; i < was_set.size(); i++) {
-					if(pixels[was_set.at(i)] == 0) {
-						VF=1;
+			if(skip) {
+				PC+=2;
+			}
+		} break;
+		case OP_EXA1: { /* Skip the following instruction if the key corresponding to the hex value currently stored in register VX is not pressed */
+			const uint8_t* key_state = SDL_GetKeyboardState(NULL);
+			const uint8_t reg_val = REG(low);
+			bool skip = reg_val == 0x0 && !key_state[SDL_SCANCODE_0];
+			skip = skip || (reg_val == 0x1 && !key_state[SDL_SCANCODE_1]);
+			skip = skip || (reg_val == 0x2 && !key_state[SDL_SCANCODE_2]);
+			skip = skip || (reg_val == 0x3 && !key_state[SDL_SCANCODE_3]);
+			skip = skip || (reg_val == 0x4 && !key_state[SDL_SCANCODE_4]);
+			skip = skip || (reg_val == 0x5 && !key_state[SDL_SCANCODE_5]);
+			skip = skip || (reg_val == 0x6 && !key_state[SDL_SCANCODE_6]);
+			skip = skip || (reg_val == 0x7 && !key_state[SDL_SCANCODE_7]);
+			skip = skip || (reg_val == 0x8 && !key_state[SDL_SCANCODE_8]);
+			skip = skip || (reg_val == 0x9 && !key_state[SDL_SCANCODE_9]);
+			skip = skip || (reg_val == 0xA && !key_state[SDL_SCANCODE_A]);
+			skip = skip || (reg_val == 0xB && !key_state[SDL_SCANCODE_B]);
+			skip = skip || (reg_val == 0xC && !key_state[SDL_SCANCODE_C]);
+			skip = skip || (reg_val == 0xD && !key_state[SDL_SCANCODE_D]);
+			skip = skip || (reg_val == 0xE && !key_state[SDL_SCANCODE_E]);
+			skip = skip || (reg_val == 0xF && !key_state[SDL_SCANCODE_F]);
+
+			if(skip) {
+				PC+=2;
+			}
+		} break;
+		case OP_FX07: {	/* Store the current value of the delay timer in register VX */
+			REG(low) = delay_timer;
+		} break;
+		case OP_FX0A: { /* Wait for a key press, store the value of the key in Vx. */
+
+			SDL_Event event;
+			bool has_keypressevent = false;
+
+			while(!has_keypressevent) {
+				if(SDL_WaitEvent(&event) && event.type == SDL_KEYDOWN) {
+					switch(event.key.keysym.scancode) {
+						case SDL_SCANCODE_0:
+						REG(low) = 0x0;
+						has_keypressevent = true;
 						break;
+						case SDL_SCANCODE_1:
+						REG(low) = 0x1;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_2:
+						REG(low) = 0x2;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_3:
+						REG(low) = 0x3;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_4:
+						REG(low) = 0x4;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_5:
+						REG(low) = 0x5;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_6:
+						REG(low) = 0x6;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_7:
+						REG(low) = 0x7;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_8:
+						REG(low) = 0x8;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_9:
+						REG(low) = 0x9;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_A:
+						REG(low) = 0xA;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_B:
+						REG(low) = 0xB;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_C:
+						REG(low) = 0xC;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_D:
+						REG(low) = 0xD;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_E:
+						REG(low) = 0xE;
+						has_keypressevent = true;
+						break;
+						case SDL_SCANCODE_F:
+						REG(low) = 0xF;
+						has_keypressevent = true;
+						break;
+						default:
+							break;
 					}
 				}
 			}
-		} break;
-		case OP_FX07: {
-			assert(false);
-		} break;
-		case OP_FX0A: {
-			assert(false);
+			
+			
 		} break;
 		case OP_FX15: {
-			assert(false);
+			delay_timer = REG(low);
 		} break;
 		case OP_FX18: {
-			assert(false);
+			sound_timer = REG(low);
 		} break;
 		case OP_FX1E: {
 			ADDR += REG(low);
 		} break;
-		case OP_FX29: {
-			assert(false);
+		case OP_FX29: { /* FX29 Set I to the memory address of the sprite data corresponding to the hexadecimal digit stored in register VX */
+			ADDR = REG(low) * 0x5;
 		} break;
 		case OP_FX33: {
 			uint8_t val_in_reg = REG(low);
@@ -517,6 +667,8 @@ uint8_t font[80] =
 };
 
 int main(void) {
+	srand(time(NULL));
+
 	int rom_size;
 	memset(memory, 0, sizeof(memory));
 
@@ -528,7 +680,9 @@ int main(void) {
 	//ReadRom("roms/IBM.ch8", &memory[0x200], rom_size);
 	//ReadRom("roms/trip8.ch8", &memory[0x200], rom_size);
 	//ReadRom("roms/particle.ch8", &memory[0x200], rom_size);
-	ReadRom("roms/picture.ch8", &memory[0x200], rom_size);
+	//ReadRom("roms/INVADERS", &memory[0x200], rom_size);
+	ReadRom("roms/PONG", &memory[0x200], rom_size);
+	//ReadRom("roms/picture.ch8", &memory[0x200], rom_size);
 	PC=0x200;
 
 	//assert(rom_size % 2 == 0);
@@ -538,28 +692,31 @@ int main(void) {
 	SDL_Init(SDL_INIT_VIDEO);
 	int windowWidth = 800, windowHeight = 600;
 
-	SDL_Window* window = SDL_CreateWindow("CHIP-8", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, windowWidth, windowHeight, 0);
-
-	SDL_Renderer* renderer = SDL_CreateRenderer(window,
-		-1, SDL_RENDERER_PRESENTVSYNC);
+	SDL_Window* window = SDL_CreateWindow("CHIP-8", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, windowWidth, windowHeight, SDL_WINDOW_SHOWN);
+	renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
 
 	SDL_RenderSetLogicalSize(renderer, WIDTH, HEIGHT);
     SDL_RenderSetIntegerScale(renderer, (SDL_bool)1);
 
-	SDL_Texture* screen_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
+	screen_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
 
-	uint32_t* pixels = (uint32_t*)malloc(WIDTH*HEIGHT*4);
+	pixels = (uint32_t*)malloc(WIDTH*HEIGHT*4);
 
 	while(1) {
-
 		Instruction inst = fetch(PC);
-
 		OpCode op = decode(inst);
-
 		execute(op, inst, pixels);
 
+		if(delay_timer > 0) {
+			delay_timer--;
+		}
+		if(sound_timer > 0) {
+			BEEP;
+			sound_timer--;
+		}
+
 		PC += 2;
-		getchar();
+		//getchar();
 
 		SDL_Event event;
 
@@ -567,14 +724,16 @@ int main(void) {
 			switch(event.type) {
 				case SDL_QUIT:
 					exit(0);
+				case SDL_KEYDOWN: {
+					if(event.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+					exit(0);
+					}
+				}
 				break;
 			}
 		}
 
-        SDL_RenderClear(renderer);
-        SDL_UpdateTexture(screen_texture, NULL, pixels, WIDTH * 4);
-        SDL_RenderCopy(renderer, screen_texture, NULL, NULL);
-        SDL_RenderPresent(renderer);
+		usleep(1500);
 	}
 
     return 0;
